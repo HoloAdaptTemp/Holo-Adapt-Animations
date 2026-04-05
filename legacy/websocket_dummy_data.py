@@ -1,12 +1,23 @@
 import asyncio
 from websockets.server import serve
+import math
+import time
 
 # CSV: pitch,roll,yaw,accel_x,accel_y,accel_z,flex_1,flex_2,button_1,button_2
 
 PORT = 8765  # Change this to your desired port
 
-UINT_MAX = 2**32 - 1
-SPEED = (UINT_MAX + 1) / (2**13)
+ROTATION_MAX = math.pi  # 180 degrees in radians
+ROTATION_MIN = -math.pi  # -180 degrees in radians
+
+ACCEL_MAX = 2**31 - 1  # int32 max
+ACCEL_MIN = 2**31  # int32 min
+
+FLEX_MAX = 1.0
+FLEX_MIN = 0.0
+
+BUTTON_MAX = 1
+BUTTON_MIN = 0
 
 
 class SensorData:
@@ -53,18 +64,32 @@ async def send_data(websocket):
         0
     ]  # Start with the first attribute
     while True:
+        print(
+            f"Current attribute: {current_attribute}, Value: {getattr(sensor_data, current_attribute)}"
+        )
         await websocket.send(str(sensor_data))  # Send as CSV
         # Increment logic for attributes
         current_value = getattr(sensor_data, current_attribute)
-        is_button = current_attribute.startswith("button_")
-        button_timer = 0
-        if current_value < UINT_MAX:
-            setattr(sensor_data, current_attribute, current_value + SPEED)
+        if current_attribute in ["pitch", "roll", "yaw"]:
+            new_value = current_value + math.pi / 500  # Increment by 0.1 radians
+            if new_value > ROTATION_MAX:
+                new_value = ROTATION_MIN
+        elif current_attribute in ["accel_x", "accel_y", "accel_z"]:
+            new_value = current_value + 100000000  # Increment by a large value
+            if new_value > ACCEL_MAX:
+                new_value = ACCEL_MIN
+        elif current_attribute in ["flex_1", "flex_2"]:
+            new_value = current_value + 0.01  # Increment by 0.01
+            if new_value > FLEX_MAX:
+                new_value = FLEX_MIN
+        elif current_attribute in ["button_1", "button_2"]:
+            new_value = (current_value + 1) % 2  # Toggle between 0 and 1
         else:
-            setattr(sensor_data, current_attribute, 0)
-            # Move to next attribute
-            current_attribute = sensor_data.next_attribute(current_attribute)
-        await asyncio.sleep(0.001)  # Send every millisecond
+            new_value = current_value  # No change for unknown attributes
+        setattr(
+            sensor_data, current_attribute, new_value
+        )  # Update the current attribute with the
+        await asyncio.sleep(0)  # Yield control to allow other tasks to run
 
 
 async def main():
