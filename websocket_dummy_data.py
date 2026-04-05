@@ -6,7 +6,7 @@ from websockets.server import serve
 PORT = 8765  # Change this to your desired port
 
 UINT_MAX = 2**32 - 1
-SPEED = (UINT_MAX + 1) / (2**13)
+SPEED = (UINT_MAX + 1) / (2**5)
 
 
 class SensorData:
@@ -64,7 +64,7 @@ async def send_data(websocket):
             setattr(sensor_data, current_attribute, 0)
             # Move to next attribute
             current_attribute = sensor_data.next_attribute(current_attribute)
-        await asyncio.sleep(0.001)  # Send every millisecond
+        await asyncio.sleep(1 / 60)  # Send every millisecond
 
 
 async def main():
