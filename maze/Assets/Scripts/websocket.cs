@@ -5,39 +5,43 @@ using NativeWebSocket;
 
 public class websocket : MonoBehaviour
 {
-    // --- SINGLETON SETUP ---
+    // Singleton instance so other scripts can reference websocket.Instance
     public static websocket Instance { get; private set; }
 
-    private void Awake()
+    void Awake()
     {
-        if (Instance == null)
-        {
-            Instance = this;
-            DontDestroyOnLoad(gameObject);
-        }
-        else
-        {
-            Destroy(gameObject);
-        }
+        Instance = this;
     }
 
-    // --- PUBLIC PROPERTIES (Required by your other scripts) ---
-    public Quaternion GloveRotation => latestRotation;
-    public Vector3 GloveAcceleration => latestTranslation;
-    public float GloveFlex1 => latestFlex1;
-    public float GloveFlex2 => latestFlex2;
-    public bool Button1 => latestButton1;
-    public bool Button2 => latestButton2;
+    private WebSocket _websocketClient;
+    private float prevPitchRaw;
+    private float prevRollRaw;
+    private float prevYawRaw;
 
-    // --- PRIVATE DATA ---
-    private WebSocket websocketClient;
-    private Quaternion latestRotation = Quaternion.identity;
-    private Vector3 latestTranslation = Vector3.zero;
-    private float latestFlex1 = 0f;
-    private float latestFlex2 = 0f;
-    private bool latestButton1 = false;
-    private bool latestButton2 = false;
-    private bool hasNewValues = false;
+    // Bounds coming from the Python dummy generators:
+    // - rotations: [-PI, PI]
+    // - accel:  [-(2^31), 2^31-1]
+    // - flex:   [0.0, 1.0]
+    private const float ROT_MIN = 0f;
+    private const float ROT_MAX = 360f;
+    private const float ACCEL_MIN = -100f;
+    private const float ACCEL_MAX = 100f;
+
+    private static float Map(float value, float inMin, float inMax, float outMin, float outMax)
+    {
+        if (inMax - inMin == 0f) return outMin;
+        return (value - inMin) / (inMax - inMin) * (outMax - outMin) + outMin;
+    }
+
+    public Quaternion GloveRotation { get; private set; }
+    public Vector3 GloveRotationEuler { get; private set; }
+    public Quaternion GloveRotationDelta { get; private set; }
+    public Vector3 GloveRotationDeltaEuler { get; private set; }
+    public Vector3 GloveAcceleration { get; private set; }
+    public float GloveFlex1 { get; private set; } // in range [0, 1]
+    public float GloveFlex2 { get; private set; } // in range [0, 1]
+    public bool GloveButton1 { get; private set; } // true if pressed, false otherwise
+    public bool GloveButton2 { get; private set; } // true if pressed, false otherwise
 
     void Start()
     {
@@ -46,47 +50,53 @@ public class websocket : MonoBehaviour
 
     async void ConnectWebSocket()
     {
-        websocketClient = new WebSocket("ws://localhost:8765");
+        _websocketClient = new WebSocket("ws://localhost:8765");
 
-        websocketClient.OnOpen += () => { Debug.Log("WebSocket connection opened."); };
-        websocketClient.OnError += (e) => { Debug.LogError("WebSocket error: " + e); };
-        websocketClient.OnClose += (e) => { Debug.Log("WebSocket connection closed."); };
+        _websocketClient.OnOpen += () =>
+        {
+            Debug.Log("WebSocket connection opened.");
+        };
 
-        websocketClient.OnMessage += (bytes) =>
+        _websocketClient.OnError += (e) =>
+        {
+            Debug.LogError("WebSocket error: " + e);
+        };
+
+        _websocketClient.OnClose += (e) =>
+        {
+            Debug.Log("WebSocket connection closed.");
+        };
+
+        _websocketClient.OnMessage += (bytes) =>
         {
             string message = Encoding.UTF8.GetString(bytes);
+            // Parse and apply rotation
             ParseMessage(message);
         };
 
-        await websocketClient.Connect();
+        await _websocketClient.Connect();
+    }
+
+    async void OnDestroy()
+    {
+        if (_websocketClient != null && _websocketClient.State == WebSocketState.Open)
+        {
+            await _websocketClient.Close();
+        }
+        if (Instance == this) Instance = null;
     }
 
     void Update()
     {
 #if !UNITY_WEBGL || UNITY_EDITOR
-        websocketClient?.DispatchMessageQueue();
+        _websocketClient?.DispatchMessageQueue();
 #endif
-
-        if (hasNewValues)
-        {
-            // The original behavior: This object also rotates/moves itself
-            transform.rotation = latestRotation;
-            transform.Translate(latestTranslation, Space.Self);
-            hasNewValues = false;
-        }
-    }
-
-    async void OnDestroy()
-    {
-        if (websocketClient != null && websocketClient.State == WebSocketState.Open)
-        {
-            await websocketClient.Close();
-        }
     }
 
     void ParseMessage(string message)
     {
         string[] parts = message.Split(',');
+        // CSV: pitch,roll,yaw,accel_x,accel_y,accel_z,flex_1,flex_2,button_1,button_2
         if (parts.Length >= 10)
         {
             float.TryParse(parts[0], out float pitchRaw);
@@ -100,29 +110,57 @@ public class websocket : MonoBehaviour
             float.TryParse(parts[8], out float button1Raw);
             float.TryParse(parts[9], out float button2Raw);
 
-            const float UNIT_MAX = 4294967295f;
+            // Map rotation values (Python sends radians in [0, 360]) to degrees [0,360)
+            float pitchDeg = Map(pitchRaw, ROT_MIN, ROT_MAX, 0f, 360f);
+            float rollDeg = Map(rollRaw, ROT_MIN, ROT_MAX, 0f, 360f);
+            float yawDeg = Map(yawRaw, ROT_MIN, ROT_MAX, 0f, 360f);
 
-            // Mapping raw values
-            float pitch = (pitchRaw / UNIT_MAX) * 360f;
-            float roll = (rollRaw / UNIT_MAX) * 360f;
-            float yaw = (yawRaw / UNIT_MAX) * 360f;
-            latestRotation = Quaternion.Euler(pitch, roll, yaw);
+            // Compute previous mapped degrees for delta calculation
+            float prevPitchDeg = Map(prevPitchRaw, ROT_MIN, ROT_MAX, 0f, 360f);
+            float prevRollDeg = Map(prevRollRaw, ROT_MIN, ROT_MAX, 0f, 360f);
+            float prevYawDeg = Map(prevYawRaw, ROT_MIN, ROT_MAX, 0f, 360f);
 
-            float signX = accelXRaw > UNIT_MAX / 2 ? 1 : -1;
-            float signY = accelYRaw > UNIT_MAX / 2 ? 1 : -1;
-            float signZ = accelZRaw > UNIT_MAX / 2 ? 1 : -1;
-            latestTranslation = new Vector3(
-                (accelXRaw == 0 ? 0 : 0.01f * signX),
-                (accelYRaw == 0 ? 0 : 0.01f * signY),
-                (accelZRaw == 0 ? 0 : 0.01f * signZ)
+
+            GloveRotation = Quaternion.Euler(
+                pitchDeg,
+                yawDeg,
+                rollDeg
+            );
+            GloveRotationEuler = new Vector3(pitchDeg, yawDeg, rollDeg);
+
+            GloveRotationDelta = Quaternion.Euler(
+                pitchDeg - prevPitchDeg,
+                yawDeg - prevYawDeg,
+                rollDeg - prevRollDeg
+            );
+            GloveRotationDeltaEuler = new Vector3(
+                pitchDeg - prevPitchDeg,
+                yawDeg - prevYawDeg,
+                rollDeg - prevRollDeg
             );
 
-            latestFlex1 = flex1Raw / UNIT_MAX;
-            latestFlex2 = flex2Raw / UNIT_MAX;
-            latestButton1 = button1Raw >= UNIT_MAX / 2;
-            latestButton2 = button2Raw >= UNIT_MAX / 2;
+            // Map rotation values (Python sends accel in [-100,100]) to [-100,100]
+            float accelX = Map(accelXRaw, ACCEL_MIN, ACCEL_MAX, -100f, 100f);
+            float accelY = Map(accelYRaw, ACCEL_MIN, ACCEL_MAX, -100f, 100f);
+            float accelZ = Map(accelZRaw, ACCEL_MIN, ACCEL_MAX, -100f, 100f);
 
-            hasNewValues = true;
+            GloveAcceleration = new Vector3(
+                accelX,
+                accelY,
+                accelZ
+            );
+
+            // Flex already in [0,1] from the generator
+            GloveFlex1 = Mathf.Clamp01(flex1Raw);
+            GloveFlex2 = Mathf.Clamp01(flex2Raw);
+
+            GloveButton1 = button1Raw > 0.5f;
+            GloveButton2 = button2Raw > 0.5f;
+
+            // Save current raw values for next-delta calculation
+            prevPitchRaw = pitchRaw;
+            prevRollRaw = rollRaw;
+            prevYawRaw = yawRaw;
         }
     }
 }
